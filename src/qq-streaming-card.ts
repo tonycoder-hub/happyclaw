@@ -247,7 +247,11 @@ export class QQStreamingController {
         { err: err.message, openid: this.openid },
         'QQ streaming finalize failed, using fallback',
       );
-      await this.tryFallback(finalText);
+      // Stream already started (preview is visible). A plain send would
+      // deliver a second full copy of the same reply.
+      if (this.sentChunkCount === 0) {
+        await this.tryFallback(finalText);
+      }
       this.state = 'completed';
     }
   }
@@ -299,7 +303,9 @@ export class QQStreamingController {
     if (this.thinkingText.length > QQStreamingController.MAX_THINKING_CHARS) {
       this.thinkingText =
         '...' +
-        this.thinkingText.slice(-(QQStreamingController.MAX_THINKING_CHARS - 3));
+        this.thinkingText.slice(
+          -(QQStreamingController.MAX_THINKING_CHARS - 3),
+        );
     }
     this.thinking = true;
 
@@ -389,7 +395,9 @@ export class QQStreamingController {
       const truncated =
         this.thinkingText.length > QQStreamingController.MAX_THINKING_CHARS
           ? '...' +
-            this.thinkingText.slice(-(QQStreamingController.MAX_THINKING_CHARS - 3))
+            this.thinkingText.slice(
+              -(QQStreamingController.MAX_THINKING_CHARS - 3),
+            )
           : this.thinkingText;
       parts.push(`${label}\n${truncated}`);
     } else if (this.thinking) {
@@ -503,7 +511,10 @@ export class QQStreamingController {
         await this.doSendChunk(rawText, 1); // GENERATING
         this.lastUpdateTime = Date.now();
       } catch (err: any) {
-        logger.warn({ err: err.message, contentLen: rawText.length }, 'QQ streaming chunk failed');
+        logger.warn(
+          { err: err.message, contentLen: rawText.length },
+          'QQ streaming chunk failed',
+        );
       }
     }
   }
@@ -576,7 +587,10 @@ export class QQStreamingController {
     try {
       await this.fallbackSend(text);
     } catch (err: any) {
-      logger.warn({ err: err.message }, 'QQ streaming fallback send also failed');
+      logger.warn(
+        { err: err.message },
+        'QQ streaming fallback send also failed',
+      );
     }
   }
 
