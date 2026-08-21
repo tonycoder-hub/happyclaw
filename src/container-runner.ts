@@ -3502,6 +3502,14 @@ export async function runHostAgent(
       proc.on('close', (code, signal) => {
         clearTimeout(timeout);
         if (killTimer) clearTimeout(killTimer);
+        // detached:true puts the runner in its own process group. agent-browser
+        // / Chrome started during a host browse stay in that group after a
+        // clean exit. Timeout/error already call killProcessTree; success must
+        // reap the leftovers too, then SIGKILL anything that ignores SIGTERM.
+        killProcessTree(proc, 'SIGTERM');
+        setTimeout(() => {
+          killProcessTree(proc, 'SIGKILL');
+        }, 1000);
         const duration = Date.now() - startTime;
 
         const closeCtx: CloseHandlerContext = {
