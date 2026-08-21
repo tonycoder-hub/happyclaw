@@ -19,7 +19,11 @@ import {
 } from './config.js';
 import { detectImageMimeType } from './image-detector.js';
 import { interruptibleSleep } from './message-notifier.js';
-import { imSendFailurePolicy } from './im-send-retry-policy.js';
+import {
+  imSendFailurePolicy,
+  isUncertainAfterAcceptImError,
+  retryUnscopedImSend,
+} from './im-send-retry-policy.js';
 import { createIpcSendDeduplicator } from './ipc-send-dedup.js';
 import {
   acknowledgeIpcReplyTurn,
@@ -2945,13 +2949,31 @@ async function sendImWithRetry(
       if (delivered !== true) ok = false;
     }
   } else {
-    ok = await retryImOperation(
-      'send_message',
-      imJid,
+    // Task/notice sends have no outbox fence. An ETIMEDOUT after the
+    // provider accepted the request must not physically resend.
+    const result = await retryUnscopedImSend(
       () =>
         imManager.sendMessage(imJid, text, localImagePaths, deliveryOptions),
-      sendFailure,
+      {
+        maxAttempts: IM_SEND_MAX_RETRIES,
+        delayMs: IM_SEND_RETRY_DELAY_MS,
+        onAttemptFailure: (err, attempt) => {
+          sendFailure.error = err;
+          logger.warn(
+            { imJid, attempt, label: 'send_message', err },
+            'IM operation attempt failed',
+          );
+        },
+      },
     );
+    if (result.error !== undefined) sendFailure.error = result.error;
+    ok = result.ok;
+    if (!ok) {
+      logger.error(
+        { imJid, label: 'send_message' },
+        'IM operation failed after all retries',
+      );
+    }
   }
   if (ok) {
     imSendFailCounts.delete(imJid);
@@ -2960,6 +2982,7 @@ async function sendImWithRetry(
   // `uncertain` is not evidence that the channel is unhealthy. In particular,
   // do not auto-unbind a Bot merely because its ACK was lost after acceptance.
   if (durableScoped) return false;
+  if (isUncertainAfterAcceptImError(sendFailure.error)) return false;
   // Missing/expired/quota-exhausted WeChat context is a user-refreshable
   // delivery prerequisite, not evidence that the chat itself is dead.
   if (!imSendFailurePolicy(sendFailure.error).countsTowardChannelRemoval) {

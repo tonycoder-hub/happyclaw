@@ -32,3 +32,55 @@ export function imSendFailurePolicy(error: unknown): ImSendFailurePolicy {
     countsTowardChannelRemoval: true,
   };
 }
+
+/**
+ * A timeout after the physical send started cannot prove the provider
+ * rejected the message. The request may already have been accepted.
+ */
+export function isUncertainAfterAcceptImError(error: unknown): boolean {
+  return errorChainHasCode(error, 'ETIMEDOUT');
+}
+
+export interface RetryUnscopedImSendOptions {
+  maxAttempts?: number;
+  delayMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+  onAttemptFailure?: (error: unknown, attempt: number) => void;
+}
+
+/**
+ * Unscoped (no outbox) IM send. Pre-accept failures may still retry;
+ * an ETIMEDOUT after the physical send started must not resend.
+ */
+export async function retryUnscopedImSend(
+  send: () => Promise<void>,
+  options: RetryUnscopedImSendOptions = {},
+): Promise<{ ok: boolean; error?: unknown }> {
+  const maxAttempts = options.maxAttempts ?? 3;
+  const delayMs = options.delayMs ?? 2_000;
+  const sleep =
+    options.sleep ??
+    ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+  let lastError: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      await send();
+      return { ok: true };
+    } catch (error) {
+      lastError = error;
+      options.onAttemptFailure?.(error, attempt);
+      // After the physical send started, ETIMEDOUT cannot prove rejection.
+      // Retrying would deliver a second visible copy of the same notice.
+      if (
+        isUncertainAfterAcceptImError(error) ||
+        !imSendFailurePolicy(error).retryable
+      ) {
+        return { ok: false, error };
+      }
+      if (attempt < maxAttempts - 1) {
+        await sleep(delayMs * (attempt + 1));
+      }
+    }
+  }
+  return { ok: false, error: lastError };
+}
