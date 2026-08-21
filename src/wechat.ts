@@ -31,6 +31,7 @@ import { resolveAdmittedChannelRoute } from './channel-admission.js';
 import { createWeChatHttpDispatcher } from './wechat-http.js';
 import {
   createDatabaseWeChatContextTokenStore,
+  WeChatContextTokenError,
   WeChatContextTokenManager,
   type WeChatContextTokenRecord,
   type WeChatContextTokenStore,
@@ -717,14 +718,46 @@ export function createWeChatConnection(
     }
   }
 
+  const deliveredManagedText = new Map<
+    string,
+    { token: string; text: string; sentChunks: number }
+  >();
+
   async function sendManagedText(userId: string, text: string): Promise<void> {
-    const chunks = splitTextChunks(markdownToPlainText(text), MSG_SPLIT_LIMIT);
-    const record = contextTokens.claim(userId, chunks.length);
-    await sendWithReservedContext(record, async () => {
-      for (const chunk of chunks) {
-        await sendMessageApi(userId, record.token, chunk);
+    const plain = markdownToPlainText(text);
+    const chunks = splitTextChunks(plain, MSG_SPLIT_LIMIT);
+    const preview = contextTokens.peek(userId);
+    if (!preview) {
+      throw new WeChatContextTokenError('missing', userId);
+    }
+
+    const prior = deliveredManagedText.get(userId);
+    const resumeFrom =
+      prior && prior.token === preview.token && prior.text === plain
+        ? Math.min(prior.sentChunks, chunks.length)
+        : 0;
+
+    for (let index = resumeFrom; index < chunks.length; index++) {
+      const record = contextTokens.claim(userId, 1);
+      try {
+        await sendWithReservedContext(record, async () => {
+          await sendMessageApi(userId, record.token, chunks[index]!);
+        });
+        deliveredManagedText.set(userId, {
+          token: record.token,
+          text: plain,
+          sentChunks: index + 1,
+        });
+      } catch (error) {
+        if (isWeChatContextTokenRejection(error)) {
+          deliveredManagedText.delete(userId);
+        } else if (!(error instanceof WeChatApiError)) {
+          contextTokens.release(record, 1);
+        }
+        throw error;
       }
-    });
+    }
+    deliveredManagedText.delete(userId);
   }
 
   async function getTypingTicket(
@@ -1450,6 +1483,7 @@ export function createWeChatConnection(
 
       dedup.clear();
       contextTokens.clearMemory();
+      deliveredManagedText.clear();
       knownJids.clear();
       rejectTimestamps.clear();
       logger.info(logContext, 'WeChat iLink poller disconnected');

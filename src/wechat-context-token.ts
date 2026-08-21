@@ -3,9 +3,11 @@ import {
   deleteWeChatContextToken,
   isDatabaseInitialized,
   listWeChatContextTokens,
+  releaseWeChatContextToken,
   upsertWeChatContextToken,
   type StoredWeChatContextToken,
   type WeChatContextTokenClaimResult,
+  type WeChatContextTokenReleaseResult,
 } from './db.js';
 
 // Tencent does not publish a stable machine-readable contract for these
@@ -38,6 +40,15 @@ export interface WeChatContextTokenClaimInput {
   nowMs: number;
 }
 
+export interface WeChatContextTokenReleaseInput {
+  accountId: string;
+  userId: string;
+  expectedToken: string;
+  expectedRefreshedAtMs: number;
+  expectedSourceMessageId?: string | null;
+  releaseCount: number;
+}
+
 export interface WeChatContextTokenStore {
   list(accountId: string): WeChatContextTokenRecord[];
   upsert(input: {
@@ -53,6 +64,11 @@ export interface WeChatContextTokenStore {
   ):
     | { status: 'claimed'; record: WeChatContextTokenRecord }
     | { status: 'missing' | 'changed' | 'expired' | 'quota_exhausted' };
+  release(
+    input: WeChatContextTokenReleaseInput,
+  ):
+    | { status: 'released'; record: WeChatContextTokenRecord }
+    | { status: 'missing' | 'changed' };
   delete(input: {
     accountId: string;
     userId: string;
@@ -108,6 +124,14 @@ function fromClaim(
     : result;
 }
 
+function fromRelease(
+  result: WeChatContextTokenReleaseResult,
+): ReturnType<WeChatContextTokenStore['release']> {
+  return result.status === 'released'
+    ? { status: 'released', record: fromStored(result.record) }
+    : result;
+}
+
 export function createDatabaseWeChatContextTokenStore(): WeChatContextTokenStore | null {
   if (!isDatabaseInitialized()) return null;
   return {
@@ -135,6 +159,17 @@ export function createDatabaseWeChatContextTokenStore(): WeChatContextTokenStore
           maxSendCount: input.maxSendCount,
           maxAgeMs: input.maxAgeMs,
           nowMs: input.nowMs,
+        }),
+      ),
+    release: (input) =>
+      fromRelease(
+        releaseWeChatContextToken({
+          channelAccountId: input.accountId,
+          userId: input.userId,
+          expectedToken: input.expectedToken,
+          expectedRefreshedAtMs: input.expectedRefreshedAtMs,
+          expectedSourceMessageId: input.expectedSourceMessageId,
+          releaseCount: input.releaseCount,
         }),
       ),
     delete: (input) =>
@@ -343,6 +378,51 @@ export class WeChatContextTokenManager {
       throw new WeChatContextTokenError(result.status, userId);
     }
     throw new WeChatContextTokenError('missing', userId);
+  }
+
+  release(record: WeChatContextTokenRecord, releaseCount = 1): boolean {
+    if (!Number.isInteger(releaseCount) || releaseCount <= 0) {
+      throw new Error('WeChat context_token releaseCount must be positive');
+    }
+    const current = this.cache.get(record.userId);
+    if (
+      !current ||
+      current.token !== record.token ||
+      current.refreshedAtMs !== record.refreshedAtMs ||
+      (current.sourceMessageId ?? null) !== (record.sourceMessageId ?? null) ||
+      current.sendCount < releaseCount
+    ) {
+      return false;
+    }
+
+    if (!this.accountId || !this.store) {
+      this.cache.set(record.userId, {
+        ...current,
+        sendCount: current.sendCount - releaseCount,
+      });
+      return true;
+    }
+
+    const result = this.store.release({
+      accountId: this.accountId,
+      userId: record.userId,
+      expectedToken: record.token,
+      expectedRefreshedAtMs: record.refreshedAtMs,
+      expectedSourceMessageId: record.sourceMessageId ?? null,
+      releaseCount,
+    });
+    if (result.status === 'released') {
+      this.cache.set(record.userId, result.record);
+      return true;
+    }
+    if (result.status === 'changed') {
+      const latest = this.store
+        .list(this.accountId)
+        .find((candidate) => candidate.userId === record.userId);
+      if (latest) this.cache.set(record.userId, latest);
+      else this.cache.delete(record.userId);
+    }
+    return false;
   }
 
   peek(userId: string): WeChatContextTokenRecord | undefined {

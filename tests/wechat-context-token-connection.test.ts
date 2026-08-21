@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import type {
   WeChatContextTokenClaimInput,
   WeChatContextTokenRecord,
+  WeChatContextTokenReleaseInput,
   WeChatContextTokenStore,
 } from '../src/wechat-context-token.js';
 
@@ -76,6 +77,30 @@ class SharedStore implements WeChatContextTokenStore {
     };
     this.record = claimed;
     return { status: 'claimed', record: { ...claimed } };
+  }
+
+  release(
+    input: WeChatContextTokenReleaseInput,
+  ):
+    | { status: 'released'; record: WeChatContextTokenRecord }
+    | { status: 'missing' | 'changed' } {
+    const record = this.record;
+    if (!record) return { status: 'missing' };
+    if (
+      record.token !== input.expectedToken ||
+      record.refreshedAtMs !== input.expectedRefreshedAtMs ||
+      (input.expectedSourceMessageId !== undefined &&
+        (record.sourceMessageId ?? null) !== input.expectedSourceMessageId) ||
+      record.sendCount < input.releaseCount
+    ) {
+      return { status: 'changed' };
+    }
+    const released = {
+      ...record,
+      sendCount: record.sendCount - input.releaseCount,
+    };
+    this.record = released;
+    return { status: 'released', record: { ...released } };
   }
 
   delete(input: {
@@ -172,6 +197,83 @@ describe('WeChat connection durable context_token integration', () => {
     } finally {
       fs.rmSync(path.dirname(filePath), { recursive: true, force: true });
     }
+
+    await connection.disconnect();
+  });
+
+  test('multi-chunk send does not burn unused slots or resend a delivered prefix after a mid-batch 502', async () => {
+    const store = new SharedStore();
+    store.record = {
+      accountId: 'account',
+      userId: 'peer',
+      token: 'durable-secret',
+      refreshedAtMs: Date.now(),
+      sourceMessageId: 'inbound-1',
+      sourceSequence: 1,
+      sendCount: 0,
+      lastSentAtMs: null,
+    };
+    const dispatcher = {
+      close: vi.fn(async () => undefined),
+    } as unknown as Dispatcher;
+    const attemptedTexts: string[] = [];
+    const ackedTexts: string[] = [];
+    let sendAttempts = 0;
+    const fetchMock = vi.fn(
+      async (
+        url: string,
+        init?: { body?: unknown; signal?: AbortSignal | null },
+      ) => {
+        if (url.includes('sendmessage')) {
+          sendAttempts += 1;
+          const body = JSON.parse(String(init?.body));
+          const text = String(body.msg.item_list[0].text_item.text);
+          attemptedTexts.push(text);
+          if (sendAttempts === 2) {
+            return new Response('bad gateway', {
+              status: 502,
+              statusText: 'Bad Gateway',
+            });
+          }
+          ackedTexts.push(text);
+          return Response.json({ ret: 0 });
+        }
+        return waitUntilAborted(init?.signal);
+      },
+    );
+    const connection = createWeChatConnection(
+      {
+        botToken: 'bot-token',
+        ilinkBotId: 'bot-id',
+        logContext: { accountId: 'account' },
+      },
+      {
+        fetch: fetchMock as typeof fetch,
+        createDispatcher: () => dispatcher,
+        contextTokenStore: store,
+      },
+    );
+    await connection.connect({ onNewChat: vi.fn() });
+
+    const longText = 'A'.repeat(2500);
+    await expect(connection.sendMessage('peer', longText)).rejects.toThrow(
+      'HTTP 502',
+    );
+
+    const prefix = ackedTexts[0];
+    expect(prefix.length).toBeGreaterThan(0);
+    expect(prefix.length).toBeLessThan(longText.length);
+    expect(attemptedTexts).toHaveLength(2);
+    expect(store.record?.sendCount).toBe(1);
+    expect(attemptedTexts.filter((text) => text === prefix)).toHaveLength(1);
+
+    await expect(connection.sendMessage('peer', longText)).resolves.toBe(
+      undefined,
+    );
+    expect(attemptedTexts.filter((text) => text === prefix)).toHaveLength(1);
+    expect(ackedTexts.join('')).toBe(longText);
+    expect(store.record?.sendCount).toBe(2);
+    expect(sendAttempts).toBe(3);
 
     await connection.disconnect();
   });

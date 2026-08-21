@@ -10961,6 +10961,10 @@ export type WeChatContextTokenClaimResult =
   | { status: 'claimed'; record: StoredWeChatContextToken }
   | { status: 'missing' | 'changed' | 'expired' | 'quota_exhausted' };
 
+export type WeChatContextTokenReleaseResult =
+  | { status: 'released'; record: StoredWeChatContextToken }
+  | { status: 'missing' | 'changed' };
+
 /** List only one channel account's reply credentials; tokens never cross accounts. */
 export function listWeChatContextTokens(
   channelAccountId: string,
@@ -11118,6 +11122,70 @@ export function claimWeChatContextToken(input: {
           ...record,
           send_count: sendCount,
           last_sent_at_ms: input.nowMs,
+        },
+      };
+    })
+    .immediate();
+}
+
+/**
+ * Return unused sendmessage reservations when a later chunk never received a
+ * provider ACK. Compare-and-swap on the same generation as claim so a concurrent
+ * inbound refresh cannot have its quota rewritten by a stale batch.
+ */
+export function releaseWeChatContextToken(input: {
+  channelAccountId: string;
+  userId: string;
+  expectedToken: string;
+  expectedRefreshedAtMs: number;
+  expectedSourceMessageId?: string | null;
+  releaseCount: number;
+}): WeChatContextTokenReleaseResult {
+  if (!Number.isInteger(input.releaseCount) || input.releaseCount <= 0) {
+    throw new Error('WeChat context_token releaseCount must be positive');
+  }
+  return db
+    .transaction((): WeChatContextTokenReleaseResult => {
+      const record = db
+        .prepare(
+          `SELECT channel_account_id, user_id, context_token, refreshed_at_ms,
+                  source_message_id, source_sequence, send_count, last_sent_at_ms
+           FROM wechat_context_tokens
+           WHERE channel_account_id = ? AND user_id = ?`,
+        )
+        .get(input.channelAccountId, input.userId) as
+        | StoredWeChatContextToken
+        | undefined;
+      if (!record) return { status: 'missing' };
+      if (
+        record.context_token !== input.expectedToken ||
+        record.refreshed_at_ms !== input.expectedRefreshedAtMs ||
+        (input.expectedSourceMessageId !== undefined &&
+          record.source_message_id !== input.expectedSourceMessageId)
+      ) {
+        return { status: 'changed' };
+      }
+      if (record.send_count < input.releaseCount) {
+        return { status: 'changed' };
+      }
+      const sendCount = record.send_count - input.releaseCount;
+      db.prepare(
+        `UPDATE wechat_context_tokens
+         SET send_count = ?
+         WHERE channel_account_id = ? AND user_id = ?
+           AND context_token = ? AND refreshed_at_ms = ?`,
+      ).run(
+        sendCount,
+        input.channelAccountId,
+        input.userId,
+        input.expectedToken,
+        input.expectedRefreshedAtMs,
+      );
+      return {
+        status: 'released',
+        record: {
+          ...record,
+          send_count: sendCount,
         },
       };
     })
