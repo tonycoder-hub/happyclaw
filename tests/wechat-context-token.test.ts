@@ -6,6 +6,7 @@ import {
   WeChatContextTokenManager,
   type WeChatContextTokenClaimInput,
   type WeChatContextTokenRecord,
+  type WeChatContextTokenReleaseInput,
   type WeChatContextTokenStore,
 } from '../src/wechat-context-token.js';
 
@@ -68,6 +69,31 @@ class MemoryStore implements WeChatContextTokenStore {
     };
     this.rows.set(key, claimed);
     return { status: 'claimed', record: { ...claimed } };
+  }
+
+  release(
+    input: WeChatContextTokenReleaseInput,
+  ):
+    | { status: 'released'; record: WeChatContextTokenRecord }
+    | { status: 'missing' | 'changed' } {
+    const key = this.key(input.accountId, input.userId);
+    const record = this.rows.get(key);
+    if (!record) return { status: 'missing' };
+    if (
+      record.token !== input.expectedToken ||
+      record.refreshedAtMs !== input.expectedRefreshedAtMs ||
+      (input.expectedSourceMessageId !== undefined &&
+        (record.sourceMessageId ?? null) !== input.expectedSourceMessageId) ||
+      record.sendCount < input.releaseCount
+    ) {
+      return { status: 'changed' };
+    }
+    const released = {
+      ...record,
+      sendCount: record.sendCount - input.releaseCount,
+    };
+    this.rows.set(key, released);
+    return { status: 'released', record: { ...released } };
   }
 
   delete(input: {
@@ -255,6 +281,37 @@ describe('WeChat context_token lifecycle', () => {
       token: 'new-token',
       sendCount: 0,
       sourceMessageId: 'message-2',
+    });
+  });
+
+  test('releases unused reservations on the current generation only', () => {
+    const store = new MemoryStore();
+    const manager = new WeChatContextTokenManager({
+      accountId: 'account',
+      store,
+      now: () => 10_000,
+    });
+    manager.refresh('peer', 'token', 10_000, {
+      messageId: 'message-1',
+      sequence: 1,
+    });
+    const claimed = manager.claim('peer', 2);
+    expect(claimed.sendCount).toBe(2);
+    expect(manager.release(claimed, 1)).toBe(true);
+    expect(manager.peek('peer')).toMatchObject({
+      token: 'token',
+      sendCount: 1,
+    });
+    expect(store.rows.values().next().value).toMatchObject({ sendCount: 1 });
+
+    manager.refresh('peer', 'token-2', 10_001, {
+      messageId: 'message-2',
+      sequence: 2,
+    });
+    expect(manager.release(claimed, 1)).toBe(false);
+    expect(manager.peek('peer')).toMatchObject({
+      token: 'token-2',
+      sendCount: 0,
     });
   });
 });

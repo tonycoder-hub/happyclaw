@@ -199,4 +199,63 @@ describe.sequential('schema v71 WeChat context_token generations', () => {
       expect.arrayContaining(['source_message_id', 'source_sequence']),
     );
   });
+
+  test('releases unused sendmessage reservations without rewriting a newer generation', () => {
+    db.initDatabase();
+    const account = db.createChannelAccount({
+      id: 'wechat-release-account',
+      owner_user_id: 'owner',
+      provider: 'wechat',
+      name: 'WeChat',
+      secret_ref: 'channel-account:wechat-release-account',
+    });
+    db.upsertWeChatContextToken({
+      channelAccountId: account.id,
+      userId: 'peer',
+      contextToken: 'live-token',
+      refreshedAtMs: 5_000,
+      sourceMessageId: 'message-1',
+      sourceSequence: 1,
+    });
+    expect(
+      db.claimWeChatContextToken({
+        channelAccountId: account.id,
+        userId: 'peer',
+        expectedToken: 'live-token',
+        expectedRefreshedAtMs: 5_000,
+        expectedSourceMessageId: 'message-1',
+        claimCount: 2,
+        maxSendCount: 10,
+        maxAgeMs: 100_000,
+        nowMs: 6_000,
+      }),
+    ).toMatchObject({ status: 'claimed', record: { send_count: 2 } });
+    expect(
+      db.releaseWeChatContextToken({
+        channelAccountId: account.id,
+        userId: 'peer',
+        expectedToken: 'live-token',
+        expectedRefreshedAtMs: 5_000,
+        expectedSourceMessageId: 'message-1',
+        releaseCount: 1,
+      }),
+    ).toMatchObject({ status: 'released', record: { send_count: 1 } });
+    expect(db.listWeChatContextTokens(account.id)[0]).toMatchObject({
+      send_count: 1,
+    });
+    expect(
+      db.releaseWeChatContextToken({
+        channelAccountId: account.id,
+        userId: 'peer',
+        expectedToken: 'stale-token',
+        expectedRefreshedAtMs: 5_000,
+        expectedSourceMessageId: 'message-1',
+        releaseCount: 1,
+      }),
+    ).toEqual({ status: 'changed' });
+    expect(db.listWeChatContextTokens(account.id)[0]).toMatchObject({
+      send_count: 1,
+      context_token: 'live-token',
+    });
+  });
 });
