@@ -205,6 +205,42 @@ export function parseDingTalkGroupMessageResponse(
   return data;
 }
 
+export interface DingTalkC2cSendSuccess {
+  processQueryKey?: string;
+  errcode?: number;
+  errmsg?: string;
+}
+
+/** Validate C2C batchSend / sessionWebhook transport and JSON envelope. */
+export function parseDingTalkC2cSendResponse(
+  statusCode: number | undefined,
+  body: string,
+): DingTalkC2cSendSuccess {
+  if (!statusCode || statusCode < 200 || statusCode >= 300) {
+    throw new Error(
+      `DingTalk C2C send HTTP failed (${statusCode ?? 'unknown'}): ${body.slice(0, 200)}`,
+    );
+  }
+  if (!body.trim()) {
+    throw new Error('DingTalk C2C send returned an empty response');
+  }
+  let data: DingTalkC2cSendSuccess;
+  try {
+    data = JSON.parse(body) as DingTalkC2cSendSuccess;
+  } catch {
+    throw new Error('DingTalk C2C send returned invalid JSON');
+  }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('DingTalk C2C send returned an invalid envelope');
+  }
+  if (data.errcode !== undefined && Number(data.errcode) !== 0) {
+    throw new Error(
+      `DingTalk C2C send API error: ${data.errcode} ${data.errmsg ?? ''}`,
+    );
+  }
+  return data;
+}
+
 interface DingTalkAccessToken {
   token: string;
   expiresAt: number;
@@ -745,15 +781,8 @@ export function createDingTalkConnection(
           res.on('data', (chunk: Buffer) => chunks.push(chunk));
           res.on('end', () => {
             const body = Buffer.concat(chunks).toString('utf-8');
-            if (res.statusCode && res.statusCode >= 400) {
-              reject(
-                new Error(`DingTalk HTTP failed (${res.statusCode}): ${body}`),
-              );
-              return;
-            }
-            // Also check DingTalk API-level errcode
             try {
-              const data = JSON.parse(body);
+              const data = parseDingTalkC2cSendResponse(res.statusCode, body);
               logger.info(
                 {
                   statusCode: res.statusCode,
@@ -762,16 +791,9 @@ export function createDingTalkConnection(
                 },
                 'DingTalk sendViaSessionWebhook response',
               );
-              if (data.errcode && data.errcode !== 0) {
-                reject(
-                  new Error(
-                    `DingTalk API error: ${data.errcode} ${data.errmsg}`,
-                  ),
-                );
-                return;
-              }
-            } catch {
-              // Not JSON, ignore
+            } catch (err) {
+              reject(err);
+              return;
             }
             resolve();
           });
@@ -812,26 +834,11 @@ export function createDingTalkConnection(
           res.on('data', (chunk: Buffer) => chunks.push(chunk));
           res.on('end', () => {
             const respBody = Buffer.concat(chunks).toString('utf8');
-            if (res.statusCode && res.statusCode >= 400) {
-              reject(
-                new Error(
-                  `DingTalk batchSend HTTP failed (${res.statusCode}): ${respBody}`,
-                ),
-              );
-              return;
-            }
             try {
-              const data = JSON.parse(respBody);
-              if (data.errcode && data.errcode !== 0) {
-                reject(
-                  new Error(
-                    `DingTalk batchSend API error: ${data.errcode} ${data.errmsg}`,
-                  ),
-                );
-                return;
-              }
-            } catch {
-              // Not JSON, ignore
+              parseDingTalkC2cSendResponse(res.statusCode, respBody);
+            } catch (err) {
+              reject(err);
+              return;
             }
             resolve();
           });
