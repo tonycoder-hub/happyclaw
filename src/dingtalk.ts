@@ -52,6 +52,48 @@ const MSG_SPLIT_LIMIT = 4000; // DingTalk markdown card limit
 const IMAGE_MAX_BASE64_SIZE = 5 * 1024 * 1024;
 // Minimum valid image size (bytes) — discard responses that are too small to be real images
 const MIN_IMAGE_SIZE = 500;
+/** Match QQ's outbound API request budget so a blackhole peer cannot hang a send. */
+export const DINGTALK_HTTPS_REQUEST_TIMEOUT_MS = 30_000;
+
+export interface DingTalkHttpsRequestOverrides {
+  hostname?: string;
+  port?: number;
+  timeoutMs?: number;
+  rejectUnauthorized?: boolean;
+}
+
+export function dingtalkHttpsRequest(
+  options: https.RequestOptions & { timeoutMs?: number },
+  body?: string | Buffer,
+): Promise<{ statusCode: number | undefined; body: Buffer }> {
+  const timeoutMs = options.timeoutMs ?? DINGTALK_HTTPS_REQUEST_TIMEOUT_MS;
+  const requestOptions: https.RequestOptions = { ...options };
+  delete (requestOptions as { timeoutMs?: number }).timeoutMs;
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        ...requestOptions,
+        timeout: timeoutMs,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => {
+          resolve({ statusCode: res.statusCode, body: Buffer.concat(chunks) });
+        });
+        res.on('error', reject);
+      },
+    );
+    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(
+        new Error(`DingTalk HTTPS request timed out after ${timeoutMs}ms`),
+      );
+    });
+    if (body !== undefined) req.write(body);
+    req.end();
+  });
+}
 
 // ─── Types ──────────────────────────────────────────────────────
 
@@ -202,6 +244,121 @@ export function parseDingTalkGroupMessageResponse(
       'DingTalk groupMessages API returned an unrecognized success envelope',
     );
   }
+  return data;
+}
+
+export interface DingTalkC2cSendSuccess {
+  processQueryKey?: string;
+  errcode?: number;
+  errmsg?: string;
+}
+
+/** Validate C2C batchSend / sessionWebhook transport and JSON envelope. */
+export function parseDingTalkC2cSendResponse(
+  statusCode: number | undefined,
+  body: string,
+): DingTalkC2cSendSuccess {
+  if (!statusCode || statusCode < 200 || statusCode >= 300) {
+    throw new Error(
+      `DingTalk C2C send HTTP failed (${statusCode ?? 'unknown'}): ${body.slice(0, 200)}`,
+    );
+  }
+  if (!body.trim()) {
+    throw new Error('DingTalk C2C send returned an empty response');
+  }
+  let data: DingTalkC2cSendSuccess;
+  try {
+    data = JSON.parse(body) as DingTalkC2cSendSuccess;
+  } catch {
+    throw new Error('DingTalk C2C send returned invalid JSON');
+  }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('DingTalk C2C send returned an invalid envelope');
+  }
+  if (data.errcode !== undefined && Number(data.errcode) !== 0) {
+    throw new Error(
+      `DingTalk C2C send API error: ${data.errcode} ${data.errmsg ?? ''}`,
+    );
+  }
+  return data;
+}
+
+/**
+ * POST /v1.0/robot/oToMessages/batchSend
+ * Used by C2C text, file, and image message senders.
+ */
+export async function batchSendToUser(
+  userIds: string[],
+  robotCode: string,
+  token: string,
+  msgKey: string,
+  msgParam: string,
+  requestOverrides?: DingTalkHttpsRequestOverrides,
+): Promise<void> {
+  const body = JSON.stringify({ robotCode, userIds, msgKey, msgParam });
+  const { statusCode, body: respBuf } = await dingtalkHttpsRequest(
+    {
+      hostname: requestOverrides?.hostname ?? 'api.dingtalk.com',
+      port: requestOverrides?.port,
+      path: '/v1.0/robot/oToMessages/batchSend',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-acs-dingtalk-access-token': token,
+      },
+      rejectUnauthorized: requestOverrides?.rejectUnauthorized,
+      timeoutMs: requestOverrides?.timeoutMs,
+    },
+    body,
+  );
+  parseDingTalkC2cSendResponse(statusCode, respBuf.toString('utf8'));
+}
+
+/**
+ * POST /v1.0/robot/groupMessages/send
+ * Uses openConversationId (stable group ID) instead of ephemeral sessionWebhook.
+ * Ref: https://open.dingtalk.com/document/group/the-robot-sends-a-group-message
+ */
+export async function sendViaGroupMessagesAPI(
+  openConversationId: string,
+  robotCode: string,
+  token: string,
+  msgKey: string,
+  msgParam: string,
+  requestOverrides?: DingTalkHttpsRequestOverrides,
+): Promise<DingTalkGroupMessageSuccess> {
+  const body = JSON.stringify({
+    openConversationId,
+    robotCode,
+    msgKey,
+    msgParam,
+  });
+  const { statusCode, body: respBuf } = await dingtalkHttpsRequest(
+    {
+      hostname: requestOverrides?.hostname ?? 'api.dingtalk.com',
+      port: requestOverrides?.port,
+      path: '/v1.0/robot/groupMessages/send',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-acs-dingtalk-access-token': token,
+      },
+      rejectUnauthorized: requestOverrides?.rejectUnauthorized,
+      timeoutMs: requestOverrides?.timeoutMs,
+    },
+    body,
+  );
+  const respBody = respBuf.toString('utf8');
+  const data = parseDingTalkGroupMessageResponse(statusCode, respBody);
+  logger.info(
+    {
+      statusCode,
+      errcode: data.errcode,
+      errmsg: data.errmsg,
+      processQueryKey: data.processQueryKey,
+    },
+    'DingTalk sendViaGroupMessagesAPI response',
+  );
   return data;
 }
 
@@ -478,44 +635,25 @@ export function createDingTalkConnection(
     }
 
     // Fetch new token using GET method (钉钉 API 支持 GET 和 POST)
-    return new Promise<string>((resolve, reject) => {
-      const url = new URL('https://oapi.dingtalk.com/gettoken');
-      url.searchParams.set('appkey', config.clientId);
-      url.searchParams.set('appsecret', config.clientSecret);
-
-      const req = https.request(
-        {
-          hostname: url.hostname,
-          path: url.pathname + url.search,
-          method: 'GET',
-        },
-        (res) => {
-          const chunks: Buffer[] = [];
-          res.on('data', (chunk: Buffer) => chunks.push(chunk));
-          res.on('end', () => {
-            try {
-              const data = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
-              if (data.errcode !== 0) {
-                reject(new Error(`DingTalk token error: ${data.errmsg}`));
-                return;
-              }
-              const expiresIn = Number(data.expires_in) || 7200;
-              tokenInfo = {
-                token: data.access_token,
-                expiresAt: Date.now() + expiresIn * 1000,
-              };
-              logger.info({ expiresIn }, 'DingTalk access token refreshed');
-              resolve(data.access_token);
-            } catch (err) {
-              reject(err);
-            }
-          });
-          res.on('error', reject);
-        },
-      );
-      req.on('error', reject);
-      req.end();
+    const url = new URL('https://oapi.dingtalk.com/gettoken');
+    url.searchParams.set('appkey', config.clientId);
+    url.searchParams.set('appsecret', config.clientSecret);
+    const { body: tokenBuf } = await dingtalkHttpsRequest({
+      hostname: url.hostname,
+      path: url.pathname + url.search,
+      method: 'GET',
     });
+    const data = JSON.parse(tokenBuf.toString('utf-8'));
+    if (data.errcode !== 0) {
+      throw new Error(`DingTalk token error: ${data.errmsg}`);
+    }
+    const expiresIn = Number(data.expires_in) || 7200;
+    tokenInfo = {
+      token: data.access_token,
+      expiresAt: Date.now() + expiresIn * 1000,
+    };
+    logger.info({ expiresIn }, 'DingTalk access token refreshed');
+    return data.access_token;
   }
 
   // ─── REST API ──────────────────────────────────────────────
@@ -528,57 +666,42 @@ export function createDingTalkConnection(
     const token = await getAccessToken();
     const url = new URL(path, DINGTALK_API_BASE);
     const bodyStr = body ? JSON.stringify(body) : undefined;
-
-    return new Promise<T>((resolve, reject) => {
-      const req = https.request(
-        {
-          hostname: url.hostname,
-          path: url.pathname + url.search,
-          method,
-          headers: {
-            'x-acs-dingtalk-access-token': token,
-            'Content-Type': 'application/json',
-            ...(bodyStr
-              ? { 'Content-Length': String(Buffer.byteLength(bodyStr)) }
-              : {}),
-          },
+    const { statusCode, body: respBuf } = await dingtalkHttpsRequest(
+      {
+        hostname: url.hostname,
+        path: url.pathname + url.search,
+        method,
+        headers: {
+          'x-acs-dingtalk-access-token': token,
+          'Content-Type': 'application/json',
+          ...(bodyStr
+            ? { 'Content-Length': String(Buffer.byteLength(bodyStr)) }
+            : {}),
         },
-        (res) => {
-          const chunks: Buffer[] = [];
-          res.on('data', (chunk: Buffer) => chunks.push(chunk));
-          res.on('end', () => {
-            const text = Buffer.concat(chunks).toString('utf-8');
-            try {
-              const data = JSON.parse(text);
-              if (res.statusCode && res.statusCode >= 400) {
-                const errMsg = data.message || data.msg || text;
-                reject(
-                  new Error(
-                    `DingTalk API ${method} ${path} failed (${res.statusCode}): ${errMsg}`,
-                  ),
-                );
-                return;
-              }
-              resolve(data as T);
-            } catch {
-              if (res.statusCode && res.statusCode >= 400) {
-                reject(
-                  new Error(
-                    `DingTalk API ${method} ${path} failed (${res.statusCode}): ${text}`,
-                  ),
-                );
-              } else {
-                resolve({} as T);
-              }
-            }
-          });
-          res.on('error', reject);
-        },
-      );
-      req.on('error', reject);
-      if (bodyStr) req.write(bodyStr);
-      req.end();
-    });
+      },
+      bodyStr,
+    );
+    const text = respBuf.toString('utf-8');
+    try {
+      const data = JSON.parse(text);
+      if (statusCode && statusCode >= 400) {
+        const errMsg = data.message || data.msg || text;
+        throw new Error(
+          `DingTalk API ${method} ${path} failed (${statusCode}): ${errMsg}`,
+        );
+      }
+      return data as T;
+    } catch (err) {
+      if (err instanceof SyntaxError) {
+        if (statusCode && statusCode >= 400) {
+          throw new Error(
+            `DingTalk API ${method} ${path} failed (${statusCode}): ${text}`,
+          );
+        }
+        return {} as T;
+      }
+      throw err;
+    }
   }
 
   /**
@@ -728,120 +851,29 @@ export function createDingTalkConnection(
           },
         };
 
-    return new Promise<void>((resolve, reject) => {
-      const url = new URL(sessionWebhook);
-      const req = https.request(
-        {
-          hostname: url.hostname,
-          path: url.pathname + url.search,
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-acs-dingtalk-access-token': token,
-          },
+    const url = new URL(sessionWebhook);
+    const { statusCode, body: respBuf } = await dingtalkHttpsRequest(
+      {
+        hostname: url.hostname,
+        path: url.pathname + url.search,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-acs-dingtalk-access-token': token,
         },
-        (res) => {
-          const chunks: Buffer[] = [];
-          res.on('data', (chunk: Buffer) => chunks.push(chunk));
-          res.on('end', () => {
-            const body = Buffer.concat(chunks).toString('utf-8');
-            if (res.statusCode && res.statusCode >= 400) {
-              reject(
-                new Error(`DingTalk HTTP failed (${res.statusCode}): ${body}`),
-              );
-              return;
-            }
-            // Also check DingTalk API-level errcode
-            try {
-              const data = JSON.parse(body);
-              logger.info(
-                {
-                  statusCode: res.statusCode,
-                  errcode: data.errcode,
-                  errmsg: data.errmsg,
-                },
-                'DingTalk sendViaSessionWebhook response',
-              );
-              if (data.errcode && data.errcode !== 0) {
-                reject(
-                  new Error(
-                    `DingTalk API error: ${data.errcode} ${data.errmsg}`,
-                  ),
-                );
-                return;
-              }
-            } catch {
-              // Not JSON, ignore
-            }
-            resolve();
-          });
-          res.on('error', reject);
-        },
-      );
-      req.on('error', reject);
-      req.write(JSON.stringify(body));
-      req.end();
-    });
-  }
-
-  /**
-   * Common helper: POST /v1.0/robot/oToMessages/batchSend
-   * Used by C2C text, file, and image message senders.
-   */
-  async function batchSendToUser(
-    userIds: string[],
-    robotCode: string,
-    token: string,
-    msgKey: string,
-    msgParam: string,
-  ): Promise<void> {
-    const body = JSON.stringify({ robotCode, userIds, msgKey, msgParam });
-    return new Promise<void>((resolve, reject) => {
-      const req = https.request(
-        {
-          hostname: 'api.dingtalk.com',
-          path: '/v1.0/robot/oToMessages/batchSend',
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-acs-dingtalk-access-token': token,
-          },
-        },
-        (res) => {
-          const chunks: Buffer[] = [];
-          res.on('data', (chunk: Buffer) => chunks.push(chunk));
-          res.on('end', () => {
-            const respBody = Buffer.concat(chunks).toString('utf8');
-            if (res.statusCode && res.statusCode >= 400) {
-              reject(
-                new Error(
-                  `DingTalk batchSend HTTP failed (${res.statusCode}): ${respBody}`,
-                ),
-              );
-              return;
-            }
-            try {
-              const data = JSON.parse(respBody);
-              if (data.errcode && data.errcode !== 0) {
-                reject(
-                  new Error(
-                    `DingTalk batchSend API error: ${data.errcode} ${data.errmsg}`,
-                  ),
-                );
-                return;
-              }
-            } catch {
-              // Not JSON, ignore
-            }
-            resolve();
-          });
-          res.on('error', reject);
-        },
-      );
-      req.on('error', reject);
-      req.write(body);
-      req.end();
-    });
+      },
+      JSON.stringify(body),
+    );
+    const respBody = respBuf.toString('utf-8');
+    const data = parseDingTalkC2cSendResponse(statusCode, respBody);
+    logger.info(
+      {
+        statusCode,
+        errcode: data.errcode,
+        errmsg: data.errmsg,
+      },
+      'DingTalk sendViaSessionWebhook response',
+    );
   }
 
   /**
@@ -869,65 +901,20 @@ export function createDingTalkConnection(
   /**
    * Send a group message via the persistent robot/groupMessages API.
    * Uses openConversationId (stable group ID) instead of ephemeral sessionWebhook.
-   * Ref: https://open.dingtalk.com/document/group/the-robot-sends-a-group-message
    */
-  async function sendViaGroupMessagesAPI(
+  async function sendPersistentGroupMessage(
     openConversationId: string,
     msgKey: string,
     msgParam: string,
   ): Promise<void> {
     const token = await getAccessToken();
-    const robotCode = config.clientId;
-    const body = JSON.stringify({
+    await sendViaGroupMessagesAPI(
       openConversationId,
-      robotCode,
+      config.clientId,
+      token,
       msgKey,
       msgParam,
-    });
-
-    return new Promise<void>((resolve, reject) => {
-      const req = https.request(
-        {
-          hostname: 'api.dingtalk.com',
-          path: '/v1.0/robot/groupMessages/send',
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-acs-dingtalk-access-token': token,
-          },
-        },
-        (res) => {
-          const chunks: Buffer[] = [];
-          res.on('data', (chunk: Buffer) => chunks.push(chunk));
-          res.on('end', () => {
-            const respBody = Buffer.concat(chunks).toString('utf8');
-            try {
-              const data = parseDingTalkGroupMessageResponse(
-                res.statusCode,
-                respBody,
-              );
-              logger.info(
-                {
-                  statusCode: res.statusCode,
-                  errcode: data.errcode,
-                  errmsg: data.errmsg,
-                  processQueryKey: data.processQueryKey,
-                },
-                'DingTalk sendViaGroupMessagesAPI response',
-              );
-            } catch (err) {
-              reject(err);
-              return;
-            }
-            resolve();
-          });
-          res.on('error', reject);
-        },
-      );
-      req.on('error', reject);
-      req.write(body);
-      req.end();
-    });
+    );
   }
 
   // ─── File Download ─────────────────────────────────────────
@@ -944,31 +931,37 @@ export function createDingTalkConnection(
           }
           const parsedUrl = new URL(reqUrl);
           const protocol = parsedUrl.protocol === 'https:' ? https : http;
-          protocol
-            .get(reqUrl, (res) => {
-              if (
-                res.statusCode &&
-                res.statusCode >= 300 &&
-                res.statusCode < 400 &&
-                res.headers.location
-              ) {
-                doRequest(res.headers.location, redirectCount + 1);
+          const req = protocol.get(reqUrl, (res) => {
+            if (
+              res.statusCode &&
+              res.statusCode >= 300 &&
+              res.statusCode < 400 &&
+              res.headers.location
+            ) {
+              doRequest(res.headers.location, redirectCount + 1);
+              return;
+            }
+            const chunks: Buffer[] = [];
+            let total = 0;
+            res.on('data', (chunk: Buffer) => {
+              total += chunk.length;
+              if (total > MAX_FILE_SIZE) {
+                res.destroy(new Error('Image exceeds MAX_FILE_SIZE'));
                 return;
               }
-              const chunks: Buffer[] = [];
-              let total = 0;
-              res.on('data', (chunk: Buffer) => {
-                total += chunk.length;
-                if (total > MAX_FILE_SIZE) {
-                  res.destroy(new Error('Image exceeds MAX_FILE_SIZE'));
-                  return;
-                }
-                chunks.push(chunk);
-              });
-              res.on('end', () => resolve(Buffer.concat(chunks)));
-              res.on('error', reject);
-            })
-            .on('error', reject);
+              chunks.push(chunk);
+            });
+            res.on('end', () => resolve(Buffer.concat(chunks)));
+            res.on('error', reject);
+          });
+          req.setTimeout(DINGTALK_HTTPS_REQUEST_TIMEOUT_MS, () => {
+            req.destroy(
+              new Error(
+                `DingTalk HTTPS request timed out after ${DINGTALK_HTTPS_REQUEST_TIMEOUT_MS}ms`,
+              ),
+            );
+          });
+          req.on('error', reject);
         };
         doRequest(url);
       });
@@ -991,58 +984,42 @@ export function createDingTalkConnection(
     robotCode: string,
     token: string,
   ): Promise<string> {
-    const downloadUrlResp = await new Promise<{ downloadUrl?: string }>(
-      (resolve, reject) => {
-        const body = JSON.stringify({ downloadCode, robotCode });
-        const req = https.request(
-          {
-            hostname: 'api.dingtalk.com',
-            path: '/v1.0/robot/messageFiles/download',
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'x-acs-dingtalk-access-token': token,
-            },
-          },
-          (res) => {
-            const statusCode = res.statusCode ?? 0;
-            const chunks: Buffer[] = [];
-            res.on('data', (chunk: Buffer) => chunks.push(chunk));
-            res.on('end', () => {
-              const buf = Buffer.concat(chunks);
-              if (statusCode < 200 || statusCode >= 300) {
-                logger.warn(
-                  {
-                    statusCode,
-                    bodyUtf8: buf.toString('utf8').slice(0, 300),
-                  },
-                  'DingTalk download URL API non-2xx response',
-                );
-                reject(
-                  new Error(
-                    `DingTalk download URL API HTTP failed (${statusCode}): ${buf.toString('utf8').slice(0, 200)}`,
-                  ),
-                );
-                return;
-              }
-              try {
-                resolve(JSON.parse(buf.toString('utf8')));
-              } catch {
-                reject(
-                  new Error(
-                    `Invalid JSON from download URL API: ${buf.toString('utf8').slice(0, 200)}`,
-                  ),
-                );
-              }
-            });
-            res.on('error', reject);
-          },
-        );
-        req.on('error', reject);
-        req.write(body);
-        req.end();
+    const body = JSON.stringify({ downloadCode, robotCode });
+    const { statusCode, body: buf } = await dingtalkHttpsRequest(
+      {
+        hostname: 'api.dingtalk.com',
+        path: '/v1.0/robot/messageFiles/download',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-acs-dingtalk-access-token': token,
+        },
       },
+      body,
     );
+    const status = statusCode ?? 0;
+    if (status < 200 || status >= 300) {
+      logger.warn(
+        {
+          statusCode: status,
+          bodyUtf8: buf.toString('utf8').slice(0, 300),
+        },
+        'DingTalk download URL API non-2xx response',
+      );
+      throw new Error(
+        `DingTalk download URL API HTTP failed (${status}): ${buf.toString('utf8').slice(0, 200)}`,
+      );
+    }
+    let downloadUrlResp: { downloadUrl?: string };
+    try {
+      downloadUrlResp = JSON.parse(buf.toString('utf8')) as {
+        downloadUrl?: string;
+      };
+    } catch {
+      throw new Error(
+        `Invalid JSON from download URL API: ${buf.toString('utf8').slice(0, 200)}`,
+      );
+    }
 
     const downloadUrl = downloadUrlResp?.downloadUrl;
     if (!downloadUrl) {
@@ -1110,6 +1087,13 @@ export function createDingTalkConnection(
           },
         );
         req.on('error', reject);
+        req.setTimeout(DINGTALK_HTTPS_REQUEST_TIMEOUT_MS, () => {
+          req.destroy(
+            new Error(
+              `DingTalk HTTPS request timed out after ${DINGTALK_HTTPS_REQUEST_TIMEOUT_MS}ms`,
+            ),
+          );
+        });
         req.end();
       });
 
@@ -1199,6 +1183,13 @@ export function createDingTalkConnection(
           },
         );
         req.on('error', reject);
+        req.setTimeout(DINGTALK_HTTPS_REQUEST_TIMEOUT_MS, () => {
+          req.destroy(
+            new Error(
+              `DingTalk HTTPS request timed out after ${DINGTALK_HTTPS_REQUEST_TIMEOUT_MS}ms`,
+            ),
+          );
+        });
         req.end();
       });
 
@@ -1252,38 +1243,32 @@ export function createDingTalkConnection(
 
       const body = Buffer.concat(parts);
 
-      const result = await new Promise<{
+      const { body: respBuf } = await dingtalkHttpsRequest(
+        {
+          hostname: 'oapi.dingtalk.com',
+          path: `/media/upload?access_token=${token}&type=${type}`,
+          method: 'POST',
+          headers: {
+            'Content-Type': `multipart/form-data; boundary=${boundary}`,
+            'Content-Length': body.length,
+          },
+        },
+        body,
+      );
+      let result: {
         media_id?: string;
         errcode?: number;
         errmsg?: string;
-      }>((resolve, reject) => {
-        const req = https.request(
-          {
-            hostname: 'oapi.dingtalk.com',
-            path: `/media/upload?access_token=${token}&type=${type}`,
-            method: 'POST',
-            headers: {
-              'Content-Type': `multipart/form-data; boundary=${boundary}`,
-              'Content-Length': body.length,
-            },
-          },
-          (res) => {
-            const chunks: Buffer[] = [];
-            res.on('data', (chunk: Buffer) => chunks.push(chunk));
-            res.on('end', () => {
-              try {
-                resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-              } catch {
-                reject(new Error('Invalid JSON from DingTalk media upload'));
-              }
-            });
-            res.on('error', reject);
-          },
-        );
-        req.on('error', reject);
-        req.write(body);
-        req.end();
-      });
+      };
+      try {
+        result = JSON.parse(respBuf.toString('utf8')) as {
+          media_id?: string;
+          errcode?: number;
+          errmsg?: string;
+        };
+      } catch {
+        throw new Error('Invalid JSON from DingTalk media upload');
+      }
 
       if (result.errcode && result.errcode !== 0) {
         logger.warn(
@@ -1468,7 +1453,6 @@ export function createDingTalkConnection(
         logger.debug({ msgId }, 'DingTalk message already in-flight, skipping');
         return;
       }
-      dedup.markSeen(msgId);
       try {
         // Skip stale messages from before connection (hot-reload scenario)
         if (opts.ignoreMessagesBefore && data.createAt) {
@@ -1953,6 +1937,10 @@ export function createDingTalkConnection(
           false,
           { attachments: attachmentsJson, sourceJid: jid },
         );
+        // Only mark after persist. An earlier mark would suppress Stream
+        // redelivery after a failed store, which is how ACK-before-handle
+        // silently drops the message.
+        dedup.markSeen(msgId);
 
         opts.onMessagePersisted?.(
           targetJid,
@@ -1999,6 +1987,7 @@ export function createDingTalkConnection(
       }
     } catch (err) {
       logger.error({ err }, 'Error handling DingTalk robot message');
+      throw err;
     }
   }
 
@@ -2049,17 +2038,21 @@ export function createDingTalkConnection(
               'DingTalk robot message received',
             );
 
-            // Ack immediately
+            // ACK only after handle succeeds. socketCallBackResponse tells
+            // DingTalk Stream to stop retrying; an ACK-before-handle drop
+            // is silent because the platform will not redeliver.
+            try {
+              await handleRobotMessage(downstream, opts);
+            } catch (err) {
+              logger.error({ err }, 'Error in DingTalk message handler');
+              return;
+            }
+
             const messageId = downstream.headers?.messageId;
             if (messageId && client) {
               client.socketCallBackResponse(messageId, { success: true });
               logger.debug({ messageId }, 'DingTalk callback acknowledged');
             }
-
-            // Process in background
-            handleRobotMessage(downstream, opts).catch((err) => {
-              logger.error({ err }, 'Error in DingTalk message handler');
-            });
           },
         );
 
@@ -2207,7 +2200,7 @@ export function createDingTalkConnection(
           text: chunk,
         });
         try {
-          await sendViaGroupMessagesAPI(
+          await sendPersistentGroupMessage(
             openConversationId,
             'sampleMarkdown',
             msgParam,
@@ -2223,7 +2216,7 @@ export function createDingTalkConnection(
           // Fall back to plain text
           const plainContent = markdownToPlainText(chunk);
           const plainMsgParam = JSON.stringify({ content: plainContent });
-          await sendViaGroupMessagesAPI(
+          await sendPersistentGroupMessage(
             openConversationId,
             'sampleText',
             plainMsgParam,
@@ -2274,7 +2267,7 @@ export function createDingTalkConnection(
       if (isGroup && openConversationId) {
         const msgParam = JSON.stringify({ photoURL: mediaId });
         try {
-          await sendViaGroupMessagesAPI(
+          await sendPersistentGroupMessage(
             openConversationId,
             'sampleImageMsg',
             msgParam,
@@ -2385,7 +2378,7 @@ export function createDingTalkConnection(
         try {
           if (mediaType === 'image') {
             const msgParam = JSON.stringify({ photoURL: mediaId });
-            await sendViaGroupMessagesAPI(
+            await sendPersistentGroupMessage(
               openConversationId,
               'sampleImageMsg',
               msgParam,
@@ -2396,7 +2389,7 @@ export function createDingTalkConnection(
               fileName,
               fileType: ext,
             });
-            await sendViaGroupMessagesAPI(
+            await sendPersistentGroupMessage(
               openConversationId,
               'sampleFile',
               msgParam,
