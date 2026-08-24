@@ -186,6 +186,7 @@ describe('DingTalk markdown format fallback must not duplicate after timeout', (
           write: (chunk: string) => boolean;
           end: () => void;
           destroy: () => void;
+          setTimeout: (ms: number, callback?: () => void) => typeof req;
           body: string;
         };
         req.body = '';
@@ -194,6 +195,7 @@ describe('DingTalk markdown format fallback must not duplicate after timeout', (
           return true;
         };
         req.destroy = () => undefined;
+        req.setTimeout = () => req;
         req.end = () => {
           queueMicrotask(() => {
             if (path.includes('gettoken')) {
