@@ -1453,7 +1453,6 @@ export function createDingTalkConnection(
         logger.debug({ msgId }, 'DingTalk message already in-flight, skipping');
         return;
       }
-      dedup.markSeen(msgId);
       try {
         // Skip stale messages from before connection (hot-reload scenario)
         if (opts.ignoreMessagesBefore && data.createAt) {
@@ -1938,6 +1937,10 @@ export function createDingTalkConnection(
           false,
           { attachments: attachmentsJson, sourceJid: jid },
         );
+        // Only mark after persist. An earlier mark would suppress Stream
+        // redelivery after a failed store, which is how ACK-before-handle
+        // silently drops the message.
+        dedup.markSeen(msgId);
 
         opts.onMessagePersisted?.(
           targetJid,
@@ -1984,6 +1987,7 @@ export function createDingTalkConnection(
       }
     } catch (err) {
       logger.error({ err }, 'Error handling DingTalk robot message');
+      throw err;
     }
   }
 
@@ -2034,17 +2038,21 @@ export function createDingTalkConnection(
               'DingTalk robot message received',
             );
 
-            // Ack immediately
+            // ACK only after handle succeeds. socketCallBackResponse tells
+            // DingTalk Stream to stop retrying; an ACK-before-handle drop
+            // is silent because the platform will not redeliver.
+            try {
+              await handleRobotMessage(downstream, opts);
+            } catch (err) {
+              logger.error({ err }, 'Error in DingTalk message handler');
+              return;
+            }
+
             const messageId = downstream.headers?.messageId;
             if (messageId && client) {
               client.socketCallBackResponse(messageId, { success: true });
               logger.debug({ messageId }, 'DingTalk callback acknowledged');
             }
-
-            // Process in background
-            handleRobotMessage(downstream, opts).catch((err) => {
-              logger.error({ err }, 'Error in DingTalk message handler');
-            });
           },
         );
 
