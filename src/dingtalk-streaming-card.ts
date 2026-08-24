@@ -403,7 +403,11 @@ export class DingTalkStreamingCardController {
         { err: err.message, cardId: this.cardInstanceId },
         'DingTalk AI Card finalize failed, degrading',
       );
-      await this.tryFallback(finalText);
+      // The card already has streamed preview content. A plain sendMessage
+      // would deliver a second full copy of the same reply.
+      if (!this.inputingStarted) {
+        await this.tryFallback(finalText);
+      }
       this.state = 'error';
     }
   }

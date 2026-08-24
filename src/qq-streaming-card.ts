@@ -230,7 +230,11 @@ export class QQStreamingController {
         { err: err.message, openid: this.openid },
         'QQ streaming finalize failed, using fallback',
       );
-      await this.tryFallback(finalText);
+      // Stream already started (preview is visible). A plain send would
+      // deliver a second full copy of the same reply.
+      if (this.sentChunkCount === 0) {
+        await this.tryFallback(finalText);
+      }
       this.state = 'completed';
     }
   }

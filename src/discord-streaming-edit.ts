@@ -14,12 +14,7 @@
  * preserving code fence state across splits.
  */
 
-import type {
-  TextChannel,
-  DMChannel,
-  NewsChannel,
-  Message,
-} from 'discord.js';
+import type { TextChannel, DMChannel, NewsChannel, Message } from 'discord.js';
 import { logger } from './logger.js';
 
 // ─── Constants ───────────────────────────────────────────────
@@ -173,7 +168,11 @@ export class DiscordStreamingEditController {
         { err: err.message },
         'Discord streaming edit finalize failed, degrading',
       );
-      await this.tryFallback(finalText);
+      // A preview is already visible on the existing message. Sending the
+      // full text again via fallback would duplicate the reply.
+      if (this.lastPushedContent == null) {
+        await this.tryFallback(finalText);
+      }
       this.state = 'error';
     }
   }
@@ -183,8 +182,7 @@ export class DiscordStreamingEditController {
     this.clearFlushTimer();
 
     const displayText = this.accumulatedText
-      ? this.accumulatedText +
-        `\n\n> ⚠️ 已中断: ${reason ?? '用户取消'}`
+      ? this.accumulatedText + `\n\n> ⚠️ 已中断: ${reason ?? '用户取消'}`
       : `⚠️ 已中断: ${reason ?? '用户取消'}`;
 
     if (this.messages.length === 0) {
@@ -194,9 +192,7 @@ export class DiscordStreamingEditController {
 
     try {
       const lastMsg = this.messages[this.messages.length - 1];
-      const truncated = displayText.slice(
-        -(DISCORD_MSG_LIMIT),
-      );
+      const truncated = displayText.slice(-DISCORD_MSG_LIMIT);
       await lastMsg.edit(truncated);
     } catch (err: any) {
       logger.debug(
@@ -361,11 +357,7 @@ export class DiscordStreamingEditController {
     if (display.length > 0) {
       const lines = display.map((d) => {
         const icon =
-          d.status === 'running'
-            ? '🔄'
-            : d.status === 'complete'
-              ? '✅'
-              : '❌';
+          d.status === 'running' ? '🔄' : d.status === 'complete' ? '✅' : '❌';
         const summary = d.summary
           ? `  ${d.summary.length > MAX_TOOL_SUMMARY_CHARS ? d.summary.slice(0, MAX_TOOL_SUMMARY_CHARS) + '...' : d.summary}`
           : '';
@@ -470,7 +462,10 @@ export class DiscordStreamingEditController {
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
       this.doFlush().catch((err: any) => {
-        logger.debug({ err: err.message }, 'Discord streaming edit flush failed');
+        logger.debug(
+          { err: err.message },
+          'Discord streaming edit flush failed',
+        );
       });
     }, delay);
   }
@@ -501,8 +496,7 @@ export class DiscordStreamingEditController {
     // During streaming, if content exceeds limit, truncate from the beginning
     // (full split only happens on complete())
     if (content.length > DISCORD_MSG_LIMIT) {
-      const truncated =
-        '...' + content.slice(-(DISCORD_MSG_LIMIT - 3));
+      const truncated = '...' + content.slice(-(DISCORD_MSG_LIMIT - 3));
       await this.editLastMessage(truncated);
     } else {
       await this.editLastMessage(content);

@@ -222,7 +222,11 @@ export class WeComStreamingController {
         { err: err?.message, chatId: this.chatId },
         'WeCom streaming finalize failed, using fallback',
       );
-      await this.tryFallback(finalBody);
+      // Preview bubble already exists. A plain sendMessage would deliver a
+      // second full copy of the same reply.
+      if (this.sentChunkCount === 0) {
+        await this.tryFallback(finalBody);
+      }
       this.state = 'completed';
     }
   }
